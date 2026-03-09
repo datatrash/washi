@@ -64,21 +64,26 @@ impl Identifier {
 
     pub fn next(&mut self) -> String {
         loop {
-            let mut val = self.0 as isize;
+            let mut n = self.0;
             self.0 += 1;
 
-            let mut id = "".to_string();
-            while val >= 0 {
-                let ch = val % 52;
-                if ch < 26 {
-                    id += &char::from_u32('a' as u32 + ch as u32).unwrap().to_string();
-                } else {
-                    id += &char::from_u32('A' as u32 + (ch - 26) as u32).unwrap().to_string();
+            let mut identifier = String::new();
+            let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            let base = charset.len();
+
+            loop {
+                let remainder = n % base;
+                identifier.push(charset[remainder] as char);
+                n /= base;
+
+                if n == 0 {
+                    break;
                 }
 
-                val -= 52;
+                n -= 1;
             }
 
+            let id = identifier.chars().rev().collect::<String>();
             if !keywords::wgsl::RESERVED_SET.contains(&id) {
                 return id;
             }
