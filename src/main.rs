@@ -1,14 +1,18 @@
 use clap::{Parser, Subcommand};
+use itertools::Itertools;
 use shadow_rs::shadow;
+use std::collections::HashMap;
 
 pub mod format;
 
-use naga::back::wgsl::WriterFlags;
-use naga::*;
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use naga::compact::{compact, KeepUnused};
+use std::str::FromStr;
+use wgsl_parse::syntax::{
+    CaseSelector, CompoundStatement, Expression, ExpressionNode,
+    GlobalDeclaration, Ident, Statement, StatementNode, TranslationUnit, TypeExpression,
+};
+use wgsl_types::idents::{RESERVED_WORDS, iter_builtin_idents};
 use crate::format::minify_wgsl_source;
 
 shadow!(build);
@@ -33,7 +37,7 @@ enum Commands {
         /// Output filename
         #[arg(value_hint = clap::ValueHint::FilePath)]
         output_filename: PathBuf,
-    }
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -41,27 +45,26 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Minify {
-            input_filename, output_filename
+            input_filename,
+            output_filename,
         } => {
-            let m = minify(&fs::read_to_string(&input_filename)?)?;
-
-            // Minify again to also minify the local variables Naga inserts
-            let m2 = minify(&m)?;
-
-            fs::write(output_filename, m2)?;
+            fs::write(
+                output_filename,
+                minify(&fs::read_to_string(&input_filename)?)?,
+            )?;
         }
     }
 
     Ok(())
 }
 
+// very VERY hacky way to deal with swizzles for now
+pub const SWIZZLES: &[char] = &['r', 'g', 'b', 'a', 'x', 'y', 'z', 'w'];
+
+#[derive(Default)]
 pub struct Identifier(usize);
 
 impl Identifier {
-    pub fn new() -> Self {
-        Self(0)
-    }
-
     pub fn next(&mut self) -> String {
         loop {
             let mut n = self.0;
@@ -84,165 +87,250 @@ impl Identifier {
             }
 
             let id = identifier.chars().rev().collect::<String>();
-            if !keywords::wgsl::RESERVED_SET.contains(&id) {
+            if !Identifier::is_reserved(&id) {
                 return id;
             }
         }
     }
+
+    pub fn is_reserved(id: &str) -> bool {
+        id.chars().all(|c| SWIZZLES.contains(&c)) || RESERVED_WORDS.contains(&id) || iter_builtin_idents().contains(id)
+    }
+
+    pub fn next_ident(&mut self) -> Ident {
+        Ident::new(self.next())
+    }
 }
 
 pub fn minify(wgsl: &str) -> anyhow::Result<String> {
-    let mut module: Module = front::wgsl::parse_str(wgsl)?;
+    let mut module = TranslationUnit::from_str(&wgsl)?;
+    let mut minifier = Minifier::default();
+    minifier.minify(&mut module)?;
 
-    let module_info: valid::ModuleInfo =
-        valid::Validator::new(valid::ValidationFlags::all(), valid::Capabilities::all())
-            .subgroup_stages(valid::ShaderStages::all())
-            .subgroup_operations(valid::SubgroupOperationSet::all())
-            .validate(&module)?;
-
-    compact(&mut module, KeepUnused::No);
-
-    let mut m = Minifier::new();
-
-    for (_, g) in module.global_variables.iter_mut() {
-        m.minify_global(g);
-    }
-
-    for (_, f) in module.functions.iter_mut() {
-        m.minify_function(f, true);
-    }
-
-    for ep in module.entry_points.iter_mut() {
-        m.minify_function(&mut ep.function, false);
-    }
-
-    m.minify_types(&mut module);
-
-    let mut out = String::new();
-    back::wgsl::Writer::new(&mut out, WriterFlags::empty()).write(&module, &module_info)?;
-
-    Ok(minify_wgsl_source(&out))
+    Ok(minify_wgsl_source(&module.to_string()))
+    //Ok(module.to_string())
 }
 
+#[derive(Default)]
 pub struct Minifier {
     id: Identifier,
-    type_map: HashMap<Handle<Type>, Handle<Type>>,
+    ident_map: HashMap<String, Ident>,
 }
 
 impl Minifier {
-    pub fn new() -> Self {
-        Self {
-            id: Identifier::new(),
-            type_map: HashMap::new(),
-        }
-    }
+    pub fn minify(&mut self, module: &mut TranslationUnit) -> anyhow::Result<()> {
+        for decl in &mut module.global_declarations {
+            match decl.node_mut() {
+                GlobalDeclaration::Struct(s) => {
+                    self.map_ident(&mut s.ident);
 
-    pub fn minify_global(&mut self, g: &mut GlobalVariable) {
-        if let Some(name) = &mut g.name {
-            *name = self.id.next();
-        }
-    }
-
-    pub fn minify_function(&mut self, f: &mut Function, minify_name: bool) {
-        if minify_name && let Some(name) = &mut f.name {
-            *name = self.id.next();
-        }
-
-        for arg in &mut f.arguments {
-            if let Some(name) = &mut arg.name {
-                *name = self.id.next();
-            }
-        }
-
-        for (_, lv) in &mut f.local_variables.iter_mut() {
-            if let Some(name) = &mut lv.name {
-                *name = self.id.next();
-            }
-        }
-
-        for (_, ne) in f.named_expressions.iter_mut() {
-            *ne = self.id.next();
-        }
-    }
-
-    pub fn minify_types(&mut self, module: &mut Module) {
-        let mut new_types = UniqueArena::new();
-
-        for (old_handle, ty) in module.types.iter() {
-            let mut new_ty = ty.clone();
-
-            if new_ty.name.is_some() {
-                new_ty.name = Some(self.id.next());
-            }
-
-            // Update internal handles (for Structs, Arrays, Pointers)
-            self.update_type_inner(&mut new_ty.inner);
-
-            let new_handle = new_types.insert(new_ty, module.types.get_span(old_handle));
-            self.type_map.insert(old_handle, new_handle);
-        }
-        module.types = new_types;
-
-        for (_, constant) in module.constants.iter_mut() {
-            constant.ty = self.remap(constant.ty);
-        }
-
-        for (_, global) in module.global_variables.iter_mut() {
-            global.ty = self.remap(global.ty);
-        }
-
-        for (_, func) in module.functions.iter_mut() {
-            self.update_function(func);
-        }
-
-        for ep in &mut module.entry_points {
-            self.update_function(&mut ep.function);
-        }
-    }
-
-    fn remap(&self, old: Handle<Type>) -> Handle<Type> {
-        *self.type_map.get(&old).expect("Orphaned type handle found")
-    }
-
-    fn update_type_inner(&mut self, inner: &mut TypeInner) {
-        match inner {
-            TypeInner::Array { base, .. } => *base = self.remap(*base),
-            TypeInner::Pointer { base, .. } => *base = self.remap(*base),
-            TypeInner::Struct { members, .. } => {
-                for member in members {
-                    if let Some(name) = &mut member.name {
-                        *name = self.id.next();
+                    for m in &mut s.members {
+                        self.map_ident(&mut m.ident);
                     }
-                    member.ty = self.remap(member.ty);
                 }
-            }
-            TypeInner::BindingArray { base, .. } => *base = self.remap(*base),
-            _ => {}
-        }
-    }
+                GlobalDeclaration::Declaration(d) => {
+                    if let Some(t) = &mut d.ty {
+                        self.minify_type_expression(t)?;
+                    }
+                    if let Some(expr) = &mut d.initializer {
+                        self.minify_expr(expr)?;
+                    }
 
-    fn update_function(&self, func: &mut Function) {
-        // Return type
-        if let Some(ref mut result) = func.result {
-            result.ty = self.remap(result.ty);
-        }
+                    self.map_ident(&mut d.ident);
+                }
+                GlobalDeclaration::Function(f) => {
+                    if f.attributes.is_empty() {
+                        self.map_ident(&mut f.ident);
+                    } else {
+                        // Has attributes so is probably an entry point
+                        self.no_map(&mut f.ident);
+                    }
 
-        // Arguments
-        for arg in &mut func.arguments {
-            arg.ty = self.remap(arg.ty);
-        }
+                    for p in &mut f.parameters {
+                        self.map_ident(&mut p.ident);
+                        self.minify_type_expression(&mut p.ty)?;
+                    }
 
-        // Local Variables
-        for (_, local) in func.local_variables.iter_mut() {
-            local.ty = self.remap(local.ty);
-        }
+                    self.minify_compound_statement(&mut f.body)?;
 
-        // Expressions
-        for (_, expr) in func.expressions.iter_mut() {
-            match expr {
-                Expression::Compose { ty, .. } => *ty = self.remap(*ty),
+                    if let Some(t) = &mut f.return_type {
+                        self.minify_type_expression(t)?;
+                    }
+                }
                 _ => {}
             }
         }
+
+        Ok(())
+    }
+
+    fn minify_stmt(&mut self, stmt: &mut StatementNode) -> anyhow::Result<()> {
+        match stmt.node_mut() {
+            Statement::Void => {}
+            Statement::Compound(stmt) => {
+                self.minify_compound_statement(stmt)?;
+            }
+            Statement::Assignment(stmt) => {
+                self.minify_expr(&mut stmt.lhs)?;
+                self.minify_expr(&mut stmt.rhs)?;
+            }
+            Statement::Increment(stmt) => {
+                self.minify_expr(&mut stmt.expression)?;
+            }
+            Statement::Decrement(stmt) => {
+                self.minify_expr(&mut stmt.expression)?;
+            }
+            Statement::If(stmt) => {
+                self.minify_compound_statement(&mut stmt.if_clause.body)?;
+                self.minify_expr(&mut stmt.if_clause.expression)?;
+                if let Some(else_clause) = &mut stmt.else_clause {
+                    self.minify_compound_statement(&mut else_clause.body)?;
+                }
+                for else_if in &mut stmt.else_if_clauses {
+                    self.minify_compound_statement(&mut else_if.body)?;
+                    self.minify_expr(&mut else_if.expression)?;
+                }
+            }
+            Statement::Switch(stmt) => {
+                self.minify_expr(&mut stmt.expression)?;
+                for clause in &mut stmt.clauses {
+                    self.minify_compound_statement(&mut clause.body)?;
+                    for sel in &mut clause.case_selectors {
+                        match sel {
+                            CaseSelector::Default => {}
+                            CaseSelector::Expression(expr) => {
+                                self.minify_expr(expr)?;
+                            }
+                        }
+                    }
+                }
+            }
+            Statement::Loop(stmt) => {
+                self.minify_compound_statement(&mut stmt.body)?;
+            }
+            Statement::For(stmt) => {
+                if let Some(stmt) = &mut stmt.initializer {
+                    self.minify_stmt(stmt)?;
+                }
+                if let Some(expr) = &mut stmt.condition {
+                    self.minify_expr(expr)?;
+                }
+                self.minify_compound_statement(&mut stmt.body)?;
+                if let Some(stmt) = &mut stmt.update {
+                    self.minify_stmt(stmt)?;
+                }
+            }
+            Statement::While(stmt) => {
+                self.minify_expr(&mut stmt.condition)?;
+                self.minify_compound_statement(&mut stmt.body)?;
+            }
+            Statement::Break(_) => {}
+            Statement::Continue(_) => {}
+            Statement::Return(stmt) => {
+                if let Some(expr) = &mut stmt.expression {
+                    self.minify_expr(expr)?;
+                }
+            }
+            Statement::Discard(_) => {}
+            Statement::FunctionCall(stmt) => {
+                self.minify_type_expression(&mut stmt.call.ty)?;
+                for arg in &mut stmt.call.arguments {
+                    self.minify_expr(arg)?;
+                }
+            }
+            Statement::ConstAssert(stmt) => {
+                self.minify_expr(&mut stmt.expression)?;
+            }
+            Statement::Declaration(stmt) => {
+                if let Some(expr) = &mut stmt.initializer {
+                    self.minify_expr(expr)?;
+                }
+                if let Some(t) = &mut stmt.ty {
+                    self.minify_type_expression(t)?;
+                }
+                self.map_ident(&mut stmt.ident);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn minify_expr(&mut self, expr: &mut ExpressionNode) -> anyhow::Result<()> {
+        match expr.node_mut() {
+            Expression::Literal(_) => {}
+            Expression::Parenthesized(expr) => {
+                self.minify_expr(&mut expr.expression)?;
+            }
+            Expression::NamedComponent(expr) => {
+                self.minify_expr(&mut expr.base)?;
+                self.map_ident(&mut expr.component);
+            }
+            Expression::Indexing(expr) => {
+                self.minify_expr(&mut expr.base)?;
+                self.minify_expr(&mut expr.index)?;
+            }
+            Expression::Unary(expr) => {
+                self.minify_expr(&mut expr.operand)?;
+            }
+            Expression::Binary(expr) => {
+                self.minify_expr(&mut expr.left)?;
+                self.minify_expr(&mut expr.right)?;
+            }
+            Expression::FunctionCall(expr) => {
+                for arg in &mut expr.arguments {
+                    self.minify_expr(arg)?;
+                }
+                self.minify_type_expression(&mut expr.ty)?;
+            }
+            Expression::TypeOrIdentifier(expr) => {
+                self.minify_type_expression(expr)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn map_ident(&mut self, ident: &mut Ident) {
+        let old = ident.to_string();
+
+        if Identifier::is_reserved(&old) {
+            self.no_map(ident);
+            return;
+        }
+
+        if self.ident_map.contains_key(&old) {
+            *ident = self.ident_map.get(&old).unwrap().clone();
+            return;
+        }
+
+        let new_ident = self.id.next_ident();
+        self.ident_map.insert(old, new_ident.clone());
+        *ident = new_ident;
+    }
+
+    fn no_map(&mut self, ident: &mut Ident) {
+        self.ident_map.insert(ident.to_string(), ident.clone());
+    }
+
+    fn minify_type_expression(&mut self, t: &mut TypeExpression) -> anyhow::Result<()> {
+        match &mut t.template_args {
+            Some(templ) => {
+                for t in templ {
+                    self.minify_expr(&mut t.expression)?;
+                }
+            }
+            None => {
+                self.map_ident(&mut t.ident);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn minify_compound_statement(&mut self, stmt: &mut CompoundStatement) -> anyhow::Result<()> {
+        for stmt in &mut stmt.statements {
+            self.minify_stmt(stmt)?;
+        }
+        Ok(())
     }
 }

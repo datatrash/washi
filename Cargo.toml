@@ -13,9 +13,11 @@ dist = true
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.5.60", features = ["derive"] }
-naga = { version = "28.0.0", features = ["wgsl-in", "wgsl-out"] }
+itertools = "0.14.0"
 shadow-rs = { version = "1.7.0", default-features = false }
 unicode-ident = "1.0.24"
+wgsl-parse = "0.3.2"
+wgsl-types = "0.3.2"
 
 [build-dependencies]
 anyhow = "1.0.102"
