@@ -1,0 +1,27 @@
+[package]
+name = "washi"
+authors = ["sagacity"]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/datatrash/washi"
+publish = false
+
+[package.metadata.dist]
+dist = true
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive"] }
+naga = { version = "28.0.0", features = ["wgsl-in", "wgsl-out"] }
+shadow-rs = { version = "1.7.0", default-features = false }
+unicode-ident = "1.0.24"
+
+[build-dependencies]
+anyhow = "1.0.102"
+shadow-rs = "1.7.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
