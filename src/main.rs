@@ -1,19 +1,20 @@
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use shadow_rs::shadow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub mod format;
 
+use crate::format::minify_wgsl_source;
+use glob::glob;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use wgsl_parse::syntax::{
-    CaseSelector, CompoundStatement, Expression, ExpressionNode,
-    GlobalDeclaration, Ident, Statement, StatementNode, TranslationUnit, TypeExpression,
+    CaseSelector, CompoundStatement, Expression, ExpressionNode, GlobalDeclaration, Ident,
+    Statement, StatementNode, TranslationUnit, TypeExpression,
 };
 use wgsl_types::idents::{RESERVED_WORDS, iter_builtin_idents};
-use crate::format::minify_wgsl_source;
 
 shadow!(build);
 
@@ -37,6 +38,20 @@ enum Commands {
         /// Output filename
         #[arg(value_hint = clap::ValueHint::FilePath)]
         output_filename: PathBuf,
+
+        /// Generate map file (*.map)
+        #[arg(short = 'm', long = "map")]
+        generate_map: bool,
+    },
+
+    /// Minify multiple shaders at once, generating *.min.wgsl output files
+    MinifyMultiple {
+        #[arg(help = "a glob pattern, like 'src/**/*.wgsl'")]
+        pattern: String,
+
+        /// Generate map file (washi.map)
+        #[arg(short = 'm', long = "map")]
+        generate_map: bool,
     },
 }
 
@@ -47,11 +62,50 @@ fn main() -> anyhow::Result<()> {
         Commands::Minify {
             input_filename,
             output_filename,
+            generate_map,
         } => {
-            fs::write(
-                output_filename,
-                minify(&fs::read_to_string(&input_filename)?)?,
-            )?;
+            let mut minifier = Minifier::default();
+            let mut module = TranslationUnit::from_str(&fs::read_to_string(&input_filename)?)?;
+            minifier.minify(&mut module)?;
+
+            fs::write(output_filename, minify_wgsl_source(&module.to_string()))?;
+            if generate_map {
+                minifier.write_map(&PathBuf::from(input_filename).with_extension("map"))?;
+            }
+        }
+        Commands::MinifyMultiple {
+            pattern,
+            generate_map,
+        } => {
+            let mut minifier = Minifier::default();
+
+            let files = glob(&pattern)?
+                .filter_map(|r| match r {
+                    Ok(r) => {
+                        if r.to_string_lossy().contains(".min.") {
+                            // Ignore already minified files
+                            None
+                        } else {
+                            Some(r.display().to_string())
+                        }
+                    }
+                    Err(_) => None,
+                })
+                .collect_vec();
+
+            let mut result = BTreeMap::new();
+            for file in files {
+                let mut module = TranslationUnit::from_str(&fs::read_to_string(&file)?)?;
+                minifier.minify(&mut module)?;
+                result.insert(file, minify_wgsl_source(&module.to_string()));
+            }
+            for (filename, minified) in result {
+                let out = PathBuf::from(filename).with_extension("min.wgsl");
+                fs::write(out, minified)?;
+            }
+            if generate_map {
+                minifier.write_map(&PathBuf::from("washi.map"))?;
+            }
         }
     }
 
@@ -94,21 +148,14 @@ impl Identifier {
     }
 
     pub fn is_reserved(id: &str) -> bool {
-        id.chars().all(|c| SWIZZLES.contains(&c)) || RESERVED_WORDS.contains(&id) || iter_builtin_idents().contains(id)
+        id.chars().all(|c| SWIZZLES.contains(&c))
+            || RESERVED_WORDS.contains(&id)
+            || iter_builtin_idents().contains(id)
     }
 
     pub fn next_ident(&mut self) -> Ident {
         Ident::new(self.next())
     }
-}
-
-pub fn minify(wgsl: &str) -> anyhow::Result<String> {
-    let mut module = TranslationUnit::from_str(&wgsl)?;
-    let mut minifier = Minifier::default();
-    minifier.minify(&mut module)?;
-
-    Ok(minify_wgsl_source(&module.to_string()))
-    //Ok(module.to_string())
 }
 
 #[derive(Default)]
@@ -331,6 +378,17 @@ impl Minifier {
         for stmt in &mut stmt.statements {
             self.minify_stmt(stmt)?;
         }
+        Ok(())
+    }
+
+    pub fn write_map(&self, map: &Path) -> anyhow::Result<()> {
+        let mut result = "".to_string();
+        for (old, new) in &self.ident_map {
+            if old != &new.to_string() {
+                result += format!("{},{}\r\n", old, new).as_str();
+            }
+        }
+        fs::write(&map, result)?;
         Ok(())
     }
 }
