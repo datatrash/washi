@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use itertools::Itertools;
 use shadow_rs::shadow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap};
 
 pub mod format;
 
@@ -86,15 +86,18 @@ fn main() -> anyhow::Result<()> {
                             // Ignore already minified files
                             None
                         } else {
-                            Some(r.display().to_string())
+                            Some(r)
                         }
                     }
                     Err(_) => None,
                 })
                 .collect_vec();
+            if files.is_empty() {
+                return Ok(());
+            }
 
             let mut result = BTreeMap::new();
-            for file in files {
+            for file in &files {
                 let mut module = TranslationUnit::from_str(&fs::read_to_string(&file)?)?;
                 minifier.minify(&mut module)?;
                 result.insert(file, minify_wgsl_source(&module.to_string()));
@@ -104,7 +107,8 @@ fn main() -> anyhow::Result<()> {
                 fs::write(out, minified)?;
             }
             if generate_map {
-                minifier.write_map(&PathBuf::from("washi.map"))?;
+                let map_path = find_rootmost(&files).expect("Could not determine map output path");
+                minifier.write_map(&map_path.join("washi.map"))?;
             }
         }
     }
@@ -161,7 +165,7 @@ impl Identifier {
 #[derive(Default)]
 pub struct Minifier {
     id: Identifier,
-    ident_map: HashMap<String, Ident>,
+    ident_map: BTreeMap<String, Ident>,
 }
 
 impl Minifier {
@@ -391,4 +395,15 @@ impl Minifier {
         fs::write(&map, result)?;
         Ok(())
     }
+}
+
+fn find_rootmost(paths: &[PathBuf]) -> Option<PathBuf> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    let paths = paths.iter()
+        .filter_map(|p| p.parent())
+        .sorted_by_key(|p| p.components().count()).collect::<Vec<_>>();
+    Some(paths[0].to_path_buf())
 }
