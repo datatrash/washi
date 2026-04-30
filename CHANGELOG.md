@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.1] - 2026-04-30
+
+### Fixed
+- Module-scope `var<private>`, `var<workgroup>`, etc. are now guaranteed not to be shadowed by function parameter or local renames.
+- `type` aliases at module scope are now also properly handled.
+
 ## [0.3.0] - 2026-04-17
 
 ### Added

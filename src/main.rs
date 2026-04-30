@@ -180,7 +180,12 @@ pub struct Minifier {
 
 impl Minifier {
     pub fn minify(&mut self, module: &mut TranslationUnit) -> anyhow::Result<()> {
-        // Predeclare global names first so local renames can avoid colliding with them.
+        // Pass 1: predeclare every module-scope identifier (struct names + members,
+        // global declarations, type aliases, and non-entry-point function names) so
+        // that `global_taken_names` is fully populated before any local rename can
+        // run. Locals must never be allowed to alias any module-scope short name --
+        // otherwise a function parameter could shadow a module-scope `var<private>`
+        // that the body references, producing nonsense WGSL.
         for decl in &mut module.global_declarations {
             match decl.node_mut() {
                 GlobalDeclaration::Struct(s) => {
@@ -193,6 +198,9 @@ impl Minifier {
                 GlobalDeclaration::Declaration(d) => {
                     self.map_global_ident(&mut d.ident);
                 }
+                GlobalDeclaration::TypeAlias(a) => {
+                    self.map_global_ident(&mut a.ident);
+                }
                 GlobalDeclaration::Function(f) => {
                     if f.attributes.is_empty() {
                         self.map_global_ident(&mut f.ident);
@@ -204,6 +212,9 @@ impl Minifier {
             }
         }
 
+        // Pass 2: minify global type expressions / initializers and function bodies.
+        // By this point `global_taken_names` is complete, so `map_local_decl` can
+        // safely skip every globally-used short name.
         for decl in &mut module.global_declarations {
             match decl.node_mut() {
                 GlobalDeclaration::Struct(_s) => {}
@@ -214,6 +225,9 @@ impl Minifier {
                     if let Some(expr) = &mut d.initializer {
                         self.minify_expr(expr)?;
                     }
+                }
+                GlobalDeclaration::TypeAlias(a) => {
+                    self.minify_type_expression(&mut a.ty)?;
                 }
                 GlobalDeclaration::Function(f) => {
                     self.begin_function_scope();
@@ -378,7 +392,15 @@ impl Minifier {
             return;
         }
 
-        let new_ident = self.global_id.next_ident();
+        // If a new global name is allocated lazily during function-body traversal,
+        // also skip any names already issued to locals in the current function so we
+        // don't introduce a backwards-shadowing collision.
+        let new_ident = loop {
+            let candidate = self.global_id.next();
+            if !self.local_name_in_use(&candidate) {
+                break Ident::new(candidate);
+            }
+        };
         self.global_ident_map.insert(old.clone(), new_ident.clone());
         self.global_taken_names.insert(new_ident.to_string());
         self.record_mapping(old, new_ident.to_string());
@@ -459,6 +481,15 @@ impl Minifier {
         self.map_global_ident(ident);
     }
 
+    /// Returns true if any active local scope has already issued `name` as a renamed
+    /// local. Used to keep lazy global rename allocations from colliding with locals
+    /// already chosen for the function currently being minified.
+    fn local_name_in_use(&self, name: &str) -> bool {
+        self.local_scopes
+            .iter()
+            .any(|scope| scope.values().any(|ident| ident.to_string() == name))
+    }
+
     fn record_mapping(&mut self, old: String, new: String) {
         self.map_entries.push((old, new));
     }
@@ -530,11 +561,26 @@ fn find_rootmost(paths: &[PathBuf]) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    fn test_data_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join(name)
+    }
+
+    fn read_test_data(name: &str) -> anyhow::Result<String> {
+        Ok(fs::read_to_string(test_data_path(name))?)
+    }
+
     fn minify_source(source: &str) -> anyhow::Result<(Minifier, String)> {
         let mut module = TranslationUnit::from_str(source)?;
         let mut minifier = Minifier::default();
         minifier.minify(&mut module)?;
         Ok((minifier, minify_wgsl_source(&module.to_string())))
+    }
+
+    fn minify_test_data(name: &str) -> anyhow::Result<(Minifier, String)> {
+        let source = read_test_data(&format!("{name}.input.wgsl"))?;
+        minify_source(&source)
     }
 
     fn strip_wgsl_whitespace(input: &str) -> String {
@@ -548,60 +594,23 @@ mod tests {
         );
     }
 
+    fn assert_minified_matches_expected(name: &str) -> anyhow::Result<Minifier> {
+        let (minifier, output) = minify_test_data(name)?;
+        let expected = read_test_data(&format!("{name}.expected.wgsl"))?;
+        assert_wgsl_eq_ignoring_whitespace(&output, &expected);
+        Ok(minifier)
+    }
+
     #[test]
     fn reuses_local_names_across_functions() -> anyhow::Result<()> {
-        let source = r#"
-            fn first() -> i32 {
-                var first_local: i32 = 1;
-                return first_local;
-            }
-
-            fn second() -> i32 {
-                var second_local: i32 = 2;
-                return second_local;
-            }
-        "#;
-
-        let (_minifier, output) = minify_source(source)?;
-        assert_wgsl_eq_ignoring_whitespace(
-            &output,
-            r#"
-            fn c() -> i32 {
-                var e: i32 = 1;
-                return e;
-            }
-            fn d() -> i32 {
-                var e: i32 = 2;
-                return e;
-            }
-            "#
-        );
-
+        assert_minified_matches_expected("reuses_local_names_across_functions")?;
         Ok(())
     }
 
     #[test]
     fn write_map_excludes_locals_and_keeps_globals() -> anyhow::Result<()> {
-        let source = r#"
-            var<private> global_name: i32 = 7;
-
-            fn use_shadowed(param_name: i32) -> i32 {
-                var local_name: i32 = param_name;
-                return local_name;
-            }
-        "#;
-
-        let (minifier, output) = minify_source(source)?;
-        assert_wgsl_eq_ignoring_whitespace(
-            &output,
-            r#"
-            var<private> c: i32 = 7;
-            fn d(e: i32) -> i32 {
-                var f: i32 = e;
-                return f;
-            }
-            "#
-        );
+        let name = "write_map_excludes_locals_and_keeps_globals";
+        let minifier = assert_minified_matches_expected(name)?;
 
         let map_path = std::env::temp_dir().join(format!(
             "washi-map-test-{}-{}.map",
@@ -615,33 +624,54 @@ mod tests {
         let map_contents = fs::read_to_string(&map_path)?;
         let _ = fs::remove_file(&map_path);
 
-        assert_eq!(map_contents, "global_name,c\r\nuse_shadowed,d\r\n");
+        let expected_map = read_test_data(&format!("{name}.expected.map"))?
+            .replace("\r\n", "\n")
+            .trim_end_matches('\n')
+            .replace('\n', "\r\n");
+        let expected_map = format!("{expected_map}\r\n");
+        assert_eq!(map_contents, expected_map);
 
         Ok(())
     }
 
     #[test]
     fn resolves_local_before_global_in_value_context() -> anyhow::Result<()> {
-        let source = r#"
-            var<private> global_name: i32 = 7;
+        assert_minified_matches_expected("resolves_local_before_global_in_value_context")?;
+        Ok(())
+    }
 
-            fn use_shadowed(param_name: i32) -> i32 {
-                var global_name: i32 = param_name;
-                return global_name;
-            }
-        "#;
+    #[test]
+    fn function_params_do_not_shadow_module_scope_globals() -> anyhow::Result<()> {
+        let (_minifier, output) = minify_test_data("function_params_do_not_shadow_module_scope_globals")?;
 
-        let (_minifier, output) = minify_source(source)?;
-        assert_wgsl_eq_ignoring_whitespace(
-            &output,
-            r#"
-            var<private> c: i32 = 7;
-            fn d(e: i32) -> i32 {
-                var f: i32 = e;
-                return f;
+        // The body references the renamed globals; the parameters of `blur` must
+        // therefore be allocated names that don't collide with those globals.
+        let module = TranslationUnit::from_str(&output)?;
+        let mut global_names = Vec::new();
+        let mut blur_param_names = Vec::new();
+        for decl in &module.global_declarations {
+            match decl.node() {
+                GlobalDeclaration::Declaration(d) => {
+                    global_names.push(d.ident.to_string());
+                }
+                GlobalDeclaration::Function(f) => {
+                    if f.attributes.is_empty() {
+                        for p in &f.parameters {
+                            blur_param_names.push(p.ident.to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
-            "#
-        );
+        }
+
+        assert_eq!(global_names.len(), 2);
+        for global in &global_names {
+            assert!(
+                !blur_param_names.contains(global),
+                "function parameter {blur_param_names:?} collided with module-scope global {global}"
+            );
+        }
 
         Ok(())
     }
