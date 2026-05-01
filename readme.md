@@ -24,6 +24,10 @@ You can also generate a map file that contains the mapping between old (unminifi
 washi minify-multiple --map *.wgsl
 ```
 
+### Preserving identifier names
+
+Identifiers whose name starts with `_` are never renamed. This is handy for names that are meaningful outside of the shader (e.g. names that the host code looks up by string, or that other tooling expects to see unchanged).
+
 ### Status
 
-This is pretty much untested, so be careful.
+This is fairly untested, so be careful.

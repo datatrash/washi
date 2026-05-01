@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.3.2] - 2026-05-01
+
+### Added
+- Identifiers prefixed with an underscore (`_`) are never renamed. Underscore-prefixed names are also excluded from `washi.map`.
+
 ## [0.3.1] - 2026-04-30
 
 ### Fixed

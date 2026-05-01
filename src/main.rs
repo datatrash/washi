@@ -381,7 +381,7 @@ impl Minifier {
     fn map_global_ident(&mut self, ident: &mut Ident) {
         let old = ident.to_string();
 
-        if Identifier::is_reserved(&old) {
+        if Identifier::is_reserved(&old) || is_preserved_ident(&old) {
             self.no_map_global(ident);
             return;
         }
@@ -445,7 +445,7 @@ impl Minifier {
         }
 
         let old = ident.to_string();
-        if Identifier::is_reserved(&old) {
+        if Identifier::is_reserved(&old) || is_preserved_ident(&old) {
             if let Some(scope) = self.local_scopes.last_mut() {
                 scope.insert(old, ident.clone());
             }
@@ -466,7 +466,7 @@ impl Minifier {
 
     fn map_value_ident(&mut self, ident: &mut Ident) {
         let old = ident.to_string();
-        if Identifier::is_reserved(&old) {
+        if Identifier::is_reserved(&old) || is_preserved_ident(&old) {
             self.no_map_global(ident);
             return;
         }
@@ -544,6 +544,10 @@ impl Minifier {
         fs::write(&map, result)?;
         Ok(())
     }
+}
+
+fn is_preserved_ident(name: &str) -> bool {
+    name.starts_with('_')
 }
 
 fn find_rootmost(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -637,6 +641,18 @@ mod tests {
     #[test]
     fn resolves_local_before_global_in_value_context() -> anyhow::Result<()> {
         assert_minified_matches_expected("resolves_local_before_global_in_value_context")?;
+        Ok(())
+    }
+
+    #[test]
+    fn underscore_prefixed_idents_are_preserved() -> anyhow::Result<()> {
+        let name = "underscore_prefixed_idents_are_preserved";
+        let minifier = assert_minified_matches_expected(name)?;
+
+        for (old, _) in &minifier.map_entries {
+            assert!(!old.starts_with('_'));
+        }
+
         Ok(())
     }
 
